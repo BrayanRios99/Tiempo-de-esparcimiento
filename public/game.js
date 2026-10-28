@@ -13,15 +13,24 @@ const config = {
 
 new Phaser.Game(config);
 
+const LAPS_TO_WIN = 5;
+const CAR_RADIUS = 20;
+const TRACK_HALF_WIDTH = 55; // la pista mide el doble de esto de ancho
+
 let scene;
 let myCar = null;
 let cursors;
-let track;
+let spaceKey;
 let trackGraphics;
+let track = null;
 let hudText;
+let bannerText;
 const otherCars = {};
+const bullets = [];
+let lastShot = 0;
+let dead = false;
+let raceFinished = false;
 
-// Estado de vueltas
 const race = {
   laps: 0,
   passedCheckpoint: false,
@@ -30,19 +39,53 @@ const race = {
   prevSide: null
 };
 
-// ---------- PISTA ----------
+// ---------- PISTA: CIRCUITO CON CURVAS ----------
+// Se define con puntos en coordenadas de 0 a 1 (porcentaje de la pantalla).
+// La linea se suaviza con una curva cerrada y el asfalto es todo lo que este cerca de ella.
+
+const CONTROL_POINTS = [
+  [0.50, 0.14], // recta superior (meta)
+  [0.72, 0.14],
+  [0.86, 0.26], // curva derecha arriba
+  [0.88, 0.46],
+  [0.76, 0.58], // ese hacia adentro
+  [0.80, 0.78], // curva derecha abajo
+  [0.62, 0.88],
+  [0.42, 0.80], // recta inferior
+  [0.28, 0.88],
+  [0.14, 0.74], // curva izquierda abajo
+  [0.14, 0.50],
+  [0.26, 0.40], // ese hacia adentro
+  [0.16, 0.24], // curva izquierda arriba
+  [0.30, 0.14]
+];
 
 function computeTrack() {
   const w = scene.scale.width;
   const h = scene.scale.height;
-  return {
-    cx: w / 2,
-    cy: h / 2,
-    outerA: w * 0.46,
-    outerB: h * 0.44,
-    innerA: w * 0.26,
-    innerB: h * 0.20
-  };
+  const pts = CONTROL_POINTS.map((p) => new Phaser.Math.Vector2(p[0] * w, p[1] * h));
+  const curve = new Phaser.Curves.Spline(pts);
+  // Cerrar el circuito: repetir los primeros puntos al final
+  const closed = new Phaser.Curves.Spline(pts.concat([pts[0].clone(), pts[1].clone()]));
+  const samples = closed.getPoints(600);
+  return { w: w, h: h, samples: samples, curve: curve };
+}
+
+// Distancia minima de un punto a la linea central
+function distanceToCenterLine(x, y) {
+  let best = Infinity;
+  const s = track.samples;
+  for (let i = 0; i < s.length; i++) {
+    const dx = x - s[i].x;
+    const dy = y - s[i].y;
+    const d = dx * dx + dy * dy;
+    if (d < best) best = d;
+  }
+  return Math.sqrt(best);
+}
+
+function onAsphalt(x, y) {
+  return distanceToCenterLine(x, y) <= TRACK_HALF_WIDTH;
 }
 
 function drawTrack() {
@@ -50,34 +93,39 @@ function drawTrack() {
   track = computeTrack();
   const g = scene.add.graphics();
   g.setDepth(0);
+  const s = track.samples;
 
-  g.fillStyle(0xdddddd, 1);
-  g.fillEllipse(track.cx, track.cy, (track.outerA + 8) * 2, (track.outerB + 8) * 2);
+  // Borde claro
+  g.lineStyle(TRACK_HALF_WIDTH * 2 + 16, 0xdddddd, 1);
+  g.beginPath();
+  g.moveTo(s[0].x, s[0].y);
+  for (let i = 1; i < s.length; i++) g.lineTo(s[i].x, s[i].y);
+  g.strokePath();
 
-  g.fillStyle(0x3a3a3a, 1);
-  g.fillEllipse(track.cx, track.cy, track.outerA * 2, track.outerB * 2);
+  // Asfalto
+  g.lineStyle(TRACK_HALF_WIDTH * 2, 0x3a3a3a, 1);
+  g.beginPath();
+  g.moveTo(s[0].x, s[0].y);
+  for (let i = 1; i < s.length; i++) g.lineTo(s[i].x, s[i].y);
+  g.strokePath();
 
-  g.fillStyle(0xdddddd, 1);
-  g.fillEllipse(track.cx, track.cy, (track.innerA + 8) * 2, (track.innerB + 8) * 2);
+  // Linea central punteada
+  g.lineStyle(3, 0xffffff, 0.35);
+  for (let i = 0; i < s.length - 1; i += 6) {
+    g.lineBetween(s[i].x, s[i].y, s[i + 1].x, s[i + 1].y);
+  }
 
-  g.fillStyle(0x2e8b2e, 1);
-  g.fillEllipse(track.cx, track.cy, track.innerA * 2, track.innerB * 2);
-
-  // Linea de meta (arriba, en el centro)
-  const topOuter = track.cy - track.outerB;
-  const topInner = track.cy - track.innerB;
-  g.fillStyle(0xffffff, 0.9);
-  g.fillRect(track.cx - 3, topOuter, 6, topInner - topOuter);
+  // Linea de meta: perpendicular a la pista en el primer punto
+  const a = s[0];
+  const b = s[3];
+  const ang = Math.atan2(b.y - a.y, b.x - a.x) + Math.PI / 2;
+  g.lineStyle(8, 0xffffff, 1);
+  g.lineBetween(
+    a.x + Math.cos(ang) * TRACK_HALF_WIDTH, a.y + Math.sin(ang) * TRACK_HALF_WIDTH,
+    a.x - Math.cos(ang) * TRACK_HALF_WIDTH, a.y - Math.sin(ang) * TRACK_HALF_WIDTH
+  );
 
   trackGraphics = g;
-}
-
-function onAsphalt(x, y) {
-  const dx = x - track.cx;
-  const dy = y - track.cy;
-  const outer = (dx * dx) / (track.outerA * track.outerA) + (dy * dy) / (track.outerB * track.outerB);
-  const inner = (dx * dx) / (track.innerA * track.innerA) + (dy * dy) / (track.innerB * track.innerB);
-  return outer <= 1 && inner >= 1;
 }
 
 // ---------- CARRO ----------
@@ -126,40 +174,150 @@ function drawCar(color) {
 }
 
 function makeCar(x, y, angle, color) {
-  const car = scene.add.container(x, y, [drawCar(color)]);
+  const body = drawCar(color);
+  const car = scene.add.container(x, y, [body]);
   car.angle = angle;
   car.setDepth(10);
+  car.health = 100;
+  car.healthBar = scene.add.graphics();
+  car.healthBar.setDepth(20);
   return car;
 }
 
+function drawHealthBar(car) {
+  const g = car.healthBar;
+  g.clear();
+  if (!car.visible) return;
+  const w = 40;
+  const x = car.x - w / 2;
+  const y = car.y - 34;
+  g.fillStyle(0x000000, 0.6);
+  g.fillRect(x - 1, y - 1, w + 2, 7);
+  const pct = Math.max(0, car.health) / 100;
+  const col = pct > 0.5 ? 0x2ecc71 : pct > 0.25 ? 0xf4c20d : 0xe63946;
+  g.fillStyle(col, 1);
+  g.fillRect(x, y, w * pct, 5);
+}
+
+// Salida: sobre la linea central, un poco antes de la meta
 function startPosition() {
-  const topOuter = track.cy - track.outerB;
-  const topInner = track.cy - track.innerB;
+  const s = track.samples;
+  const idx = s.length - 20 - Math.floor(Math.random() * 25); // atras de la meta
+  const p = s[idx];
+  const q = s[(idx + 1) % s.length];
+  const angle = Phaser.Math.RadToDeg(Math.atan2(q.y - p.y, q.x - p.x));
   return {
-    x: track.cx - 40 - Math.random() * 120,
-    y: (topOuter + topInner) / 2 + (Math.random() - 0.5) * (topInner - topOuter) * 0.5,
-    angle: 0
+    x: p.x + (Math.random() - 0.5) * 30,
+    y: p.y + (Math.random() - 0.5) * 30,
+    angle: angle
   };
+}
+
+function respawnMyCar() {
+  const s = startPosition();
+  myCar.x = s.x;
+  myCar.y = s.y;
+  myCar.angle = s.angle;
+  myCar.speed = 0;
+  myCar.lastGoodX = s.x;
+  myCar.lastGoodY = s.y;
+  myCar.setVisible(true);
+  myCar.health = 100;
+  race.passedCheckpoint = false;
+  race.prevSide = null;
+  dead = false;
+  socket.emit('playerMove', { x: s.x, y: s.y, angle: s.angle });
+}
+
+// ---------- EXPLOSION ----------
+
+function explode(x, y) {
+  for (let i = 0; i < 14; i++) {
+    const p = scene.add.circle(x, y, 4 + Math.random() * 5, i % 2 ? 0xff7f11 : 0xf4c20d);
+    p.setDepth(30);
+    const ang = Math.random() * Math.PI * 2;
+    const dist = 30 + Math.random() * 50;
+    scene.tweens.add({
+      targets: p,
+      x: x + Math.cos(ang) * dist,
+      y: y + Math.sin(ang) * dist,
+      alpha: 0,
+      duration: 600,
+      onComplete: () => p.destroy()
+    });
+  }
+}
+
+// ---------- BALAS ----------
+
+function spawnBullet(x, y, angle, owner) {
+  const rad = Phaser.Math.DegToRad(angle);
+  const sprite = scene.add.circle(x + Math.cos(rad) * 30, y + Math.sin(rad) * 30, 4, 0xffffff);
+  sprite.setDepth(15);
+  bullets.push({
+    sprite: sprite,
+    vx: Math.cos(rad) * 10,
+    vy: Math.sin(rad) * 10,
+    owner: owner,
+    life: 80
+  });
+}
+
+// Solo el DUENO de la bala comprueba si le dio a un rival, y avisa al servidor.
+function updateBullets() {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.sprite.x += b.vx;
+    b.sprite.y += b.vy;
+    b.life -= 1;
+
+    let remove = b.life <= 0;
+
+    if (!remove && b.owner === socket.id) {
+      const ids = Object.keys(otherCars);
+      for (let k = 0; k < ids.length; k++) {
+        const other = otherCars[ids[k]];
+        if (!other.visible) continue;
+        const dx = b.sprite.x - other.x;
+        const dy = b.sprite.y - other.y;
+        if (Math.sqrt(dx * dx + dy * dy) < CAR_RADIUS + 4) {
+          socket.emit('hit', { victim: ids[k] });
+          remove = true;
+          break;
+        }
+      }
+    }
+
+    if (remove) {
+      b.sprite.destroy();
+      bullets.splice(i, 1);
+    }
+  }
+}
+
+function tryShoot() {
+  if (!myCar || dead || raceFinished) return;
+  const now = scene.time.now;
+  if (now - lastShot < 350) return; // enfriamiento entre disparos
+  lastShot = now;
+  spawnBullet(myCar.x, myCar.y, myCar.angle, socket.id);
+  socket.emit('shoot', { x: myCar.x, y: myCar.y, angle: myCar.angle });
 }
 
 // ---------- CHOQUES ENTRE CARROS ----------
 
-const CAR_RADIUS = 20; // dos carros chocan si sus centros estan a menos de 2 x este valor
-
 function checkCarCollisions() {
   Object.keys(otherCars).forEach((id) => {
     const other = otherCars[id];
+    if (!other.visible) return;
     const dx = myCar.x - other.x;
     const dy = myCar.y - other.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
     const minDist = CAR_RADIUS * 2;
 
     if (dist < minDist) {
-      // Direccion de empuje: desde el otro carro hacia el mio
       const nx = dist === 0 ? 1 : dx / dist;
       const ny = dist === 0 ? 0 : dy / dist;
-
-      // Separar los carros para que no se queden pegados
       const push = minDist - dist + 1;
       const px = myCar.x + nx * push;
       const py = myCar.y + ny * push;
@@ -169,8 +327,6 @@ function checkCarCollisions() {
         myCar.lastGoodX = px;
         myCar.lastGoodY = py;
       }
-
-      // Rebote: invertir velocidad con algo de perdida
       if (Math.abs(myCar.speed) < 2) myCar.speed = myCar.speed >= 0 ? 2 : -2;
       myCar.speed = -myCar.speed * 0.7;
     }
@@ -178,6 +334,8 @@ function checkCarCollisions() {
 }
 
 // ---------- VUELTAS ----------
+// Checkpoint: pasar por la mitad de la pista (indice de muestra en la mitad del circuito).
+// Meta: cruzar el primer punto de la pista avanzando en el sentido del circuito.
 
 function formatTime(ms) {
   const total = Math.max(0, ms);
@@ -187,16 +345,31 @@ function formatTime(ms) {
   return min + ':' + String(sec).padStart(2, '0') + '.' + String(dec).padStart(2, '0');
 }
 
+function nearestSampleIndex(x, y) {
+  let best = Infinity;
+  let idx = 0;
+  const s = track.samples;
+  for (let i = 0; i < s.length; i++) {
+    const dx = x - s[i].x;
+    const dy = y - s[i].y;
+    const d = dx * dx + dy * dy;
+    if (d < best) { best = d; idx = i; }
+  }
+  return idx;
+}
+
 function updateLaps() {
-  // Punto de control abajo: si el carro pasa por la mitad inferior, marca el checkpoint
-  if (myCar.y > track.cy + track.innerB) {
+  const n = track.samples.length;
+  const idx = nearestSampleIndex(myCar.x, myCar.y);
+
+  // Checkpoint: haber pasado por la zona de la mitad del circuito
+  if (idx > n * 0.4 && idx < n * 0.6) {
     race.passedCheckpoint = true;
   }
 
-  // Cruce de la linea de meta: pasar de la izquierda a la derecha del centro, en la parte de arriba
-  const side = myCar.x >= track.cx ? 1 : -1;
-  const inTopHalf = myCar.y < track.cy;
-  if (inTopHalf && race.prevSide === -1 && side === 1) {
+  // Cruce de meta: pasar del final del circuito (ultimo 10%) al inicio (primer 10%)
+  const zone = idx < n * 0.1 ? 'start' : idx > n * 0.9 ? 'end' : 'mid';
+  if (race.prevSide === 'end' && zone === 'start') {
     if (race.passedCheckpoint) {
       const now = scene.time.now;
       const lapTime = now - race.lapStart;
@@ -204,19 +377,30 @@ function updateLaps() {
       if (race.bestLap === null || lapTime < race.bestLap) race.bestLap = lapTime;
       race.lapStart = now;
       race.passedCheckpoint = false;
+      socket.emit('lapDone');
     }
   }
-  race.prevSide = side;
+  if (zone !== 'mid') race.prevSide = zone;
+  else if (race.prevSide === 'start') race.prevSide = 'mid';
 }
 
 function updateHud() {
   const current = scene.time.now - race.lapStart;
   const best = race.bestLap === null ? '--' : formatTime(race.bestLap);
   hudText.setText(
-    'Vueltas: ' + race.laps + '\n' +
+    'Vueltas: ' + race.laps + ' / ' + LAPS_TO_WIN + '\n' +
     'Vuelta actual: ' + formatTime(current) + '\n' +
-    'Mejor vuelta: ' + best
+    'Mejor vuelta: ' + best + '\n' +
+    'Disparar: barra espaciadora'
   );
+}
+
+function showBanner(text, ms) {
+  bannerText.setText(text);
+  bannerText.setVisible(true);
+  if (ms) {
+    scene.time.delayedCall(ms, () => bannerText.setVisible(false));
+  }
 }
 
 // ---------- ESCENA ----------
@@ -224,20 +408,35 @@ function updateHud() {
 function create() {
   scene = this;
   cursors = this.input.keyboard.createCursorKeys();
+  spaceKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
 
   drawTrack();
 
   hudText = this.add.text(16, 16, '', {
     fontFamily: 'monospace',
-    fontSize: '20px',
+    fontSize: '18px',
     color: '#ffffff',
     backgroundColor: 'rgba(0,0,0,0.5)',
     padding: { x: 10, y: 8 }
   });
   hudText.setDepth(100);
 
+  bannerText = this.add.text(this.scale.width / 2, this.scale.height / 2, '', {
+    fontFamily: 'Arial',
+    fontSize: '48px',
+    fontStyle: 'bold',
+    color: '#ffffff',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    padding: { x: 24, y: 16 },
+    align: 'center'
+  });
+  bannerText.setOrigin(0.5);
+  bannerText.setDepth(200);
+  bannerText.setVisible(false);
+
   this.scale.on('resize', () => {
     drawTrack();
+    bannerText.setPosition(this.scale.width / 2, this.scale.height / 2);
   });
 
   socket.on('currentPlayers', (players) => {
@@ -253,6 +452,7 @@ function create() {
         socket.emit('playerMove', { x: s.x, y: s.y, angle: s.angle });
       } else {
         otherCars[id] = makeCar(p.x, p.y, p.angle, p.color);
+        otherCars[id].health = p.health;
       }
     });
   });
@@ -272,14 +472,75 @@ function create() {
 
   socket.on('playerLeft', (id) => {
     if (otherCars[id]) {
+      otherCars[id].healthBar.destroy();
       otherCars[id].destroy();
       delete otherCars[id];
     }
+  });
+
+  socket.on('bulletFired', (b) => {
+    spawnBullet(b.x, b.y, b.angle, b.owner);
+  });
+
+  socket.on('healthUpdate', (d) => {
+    if (d.id === socket.id) {
+      if (myCar) myCar.health = d.health;
+    } else if (otherCars[d.id]) {
+      otherCars[d.id].health = d.health;
+    }
+  });
+
+  socket.on('playerExploded', (d) => {
+    if (d.id === socket.id) {
+      if (myCar) {
+        explode(myCar.x, myCar.y);
+        myCar.setVisible(false);
+        dead = true;
+        myCar.speed = 0;
+        showBanner('¡Explotaste! Reapareces en 3 segundos', 2800);
+      }
+    } else if (otherCars[d.id]) {
+      explode(otherCars[d.id].x, otherCars[d.id].y);
+      otherCars[d.id].setVisible(false);
+    }
+  });
+
+  socket.on('playerRespawn', (d) => {
+    if (d.id === socket.id) {
+      if (myCar) respawnMyCar();
+    } else if (otherCars[d.id]) {
+      otherCars[d.id].setVisible(true);
+    }
+  });
+
+  socket.on('raceWon', (d) => {
+    raceFinished = true;
+    const mine = d.id === socket.id;
+    showBanner(mine ? '¡GANASTE LA CARRERA!' : '¡' + d.name + ' ganó la carrera!', 0);
+  });
+
+  socket.on('raceReset', () => {
+    raceFinished = false;
+    bannerText.setVisible(false);
+    race.laps = 0;
+    race.bestLap = null;
+    race.lapStart = scene.time.now;
+    if (myCar) respawnMyCar();
   });
 }
 
 function update() {
   if (!myCar) return;
+
+  drawHealthBar(myCar);
+  Object.keys(otherCars).forEach((id) => drawHealthBar(otherCars[id]));
+
+  updateBullets();
+
+  if (dead || raceFinished) {
+    updateHud();
+    return;
+  }
 
   const turnFactor = Math.min(Math.abs(myCar.speed) / 2, 1);
   if (cursors.left.isDown) myCar.angle -= 3 * turnFactor * Math.sign(myCar.speed || 1);
@@ -288,6 +549,8 @@ function update() {
   if (cursors.up.isDown) myCar.speed = Math.min(myCar.speed + 0.15, 5);
   else if (cursors.down.isDown) myCar.speed = Math.max(myCar.speed - 0.15, -2);
   else myCar.speed *= 0.98;
+
+  if (spaceKey.isDown) tryShoot();
 
   const rad = Phaser.Math.DegToRad(myCar.angle);
   const oldX = myCar.x;
@@ -301,23 +564,14 @@ function update() {
     myCar.lastGoodX = newX;
     myCar.lastGoodY = newY;
   } else {
+    // Rebote contra el borde: volver a la ultima posicion buena e invertir velocidad
     myCar.x = myCar.lastGoodX;
     myCar.y = myCar.lastGoodY;
     myCar.speed = -myCar.speed * 0.6;
-    const midA = (track.outerA + track.innerA) / 2;
-    const midB = (track.outerB + track.innerB) / 2;
-    const dx = (myCar.x - track.cx) / midA;
-    const dy = (myCar.y - track.cy) / midB;
-    const len = Math.sqrt(dx * dx + dy * dy) || 1;
-    const sign = dx * dx + dy * dy > 1 ? 1 : -1;
-    myCar.x += (-dx / len) * 0.8 * sign;
-    myCar.y += (-dy / len) * 0.8 * sign;
+    if (Math.abs(myCar.speed) < 1) myCar.speed = myCar.speed >= 0 ? 1 : -1;
   }
 
-  // Choques con otros carros
   checkCarCollisions();
-
-  // Vueltas y marcador
   updateLaps();
   updateHud();
 
